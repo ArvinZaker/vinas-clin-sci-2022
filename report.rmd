@@ -1,0 +1,1111 @@
+---
+title: "Reproducting analysis in the paper: Sex diversity in proximal tubule and endothelial gene expression in mice with ischemic acute kidney injury"
+author: "Arvin Zaker"
+date: "`r format(Sys.Date(),'%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: yes
+    fig_caption: yes
+  rmarkdown::html_document:
+    toc: yes
+    fig_caption: yes
+  html_document:
+    toc: yes
+    df_print: paged
+bibliography: ref.bib
+---
+
+
+# Abstract
+
+This study by Viñas et al.[@vinas_sex_2020] studies the sex-related differences between mice with and without acute kidney injury (AKI) Previous studies have shown that sex differences in mice might influence AKI.
+To simulate AKI, researchers performed ischemia-reperfusion injury (IRI) assay and studies male and female mice morphologically and gnomically. 
+
+The study showed that the upregulation of  cytokine, chemokine, and cell-adhesion pathways in male mice after IRI might 
+explain differences in the results.
+
+
+```{r libs,results="hide",message=F,echo=F,warning=F}
+## Load the libraries required for the analysis
+library("DESeq2")        
+library("EnhancedVolcano")
+library("RColorBrewer")   
+library("ggplot2")        
+library("tximport")        
+library("apeglm")           
+library("BiocParallel")
+library("doParallel")
+library("edgeR")
+register(MulticoreParam(6))
+# gene conversion
+library(DBI)
+#library(AnnotationDbi)
+library(org.Mm.eg.db)
+# GSEA analysis
+library(fgsea)
+
+``` 
+
+```{r funs,results="hide",message=F,echo=F,warning=F}
+rm_cols <- function(l,to_rm) {
+  colData <- l$colData
+  txi <- l$txi
+  colData <- colData[!rownames(colData) %in% to_rm,]
+  txi$counts <- txi$counts[,!colnames(txi$counts) %in% to_rm]
+  txi$abundance <- txi$abundance[,!colnames(txi$abundance) %in% to_rm]
+  txi$length <- txi$length[,!colnames(txi$length) %in% to_rm]
+  return(list(txi = txi, colData = colData))
+}
+deseq_ana <- function(l) {
+  colData <- l$colData
+  txi <- l$txi
+  dds <-DESeqDataSetFromTximport(txi,colData=colData,design=~sep)
+  dds<-DESeq(dds) 
+  return(dds)
+}
+
+shrinklfc <- function(dds) {
+  resN <- unlist(strsplit(resultsNames(dds)[2], '_')[[1]], )
+  res <- results(dds,contrast=c(resN[1], resN[2], resN[4])
+                 ,alpha=0.05)
+  res_shrunk<-lfcShrink(dds
+                  ,coef=resultsNames(dds)[2]
+                  ,res=res,type="apeglm")
+  # get the conversion to gene names
+  res_shrunk$gene <- mapIds(
+    org.Mm.eg.db,
+    keys = rownames(res_shrunk),
+    column = 'SYMBOL',
+    keytype = 'ENSEMBL'
+    )
+  return(res_shrunk)
+}
+
+plotVolcano <- function(df, labs = NA, title = NA){
+  # remove gene with no label
+  df <- df[!is.na(df$gene), ]
+  rownames(df) <- df$gene
+  EnhancedVolcano::EnhancedVolcano(df
+                    ,lab=rownames(df)
+                    , x="log2FoldChange"
+                    , y="pvalue"
+                    , title=title
+                    , subtitle=""
+                    , pCutoff=10e-3
+                    , FCcutoff=1
+                    , selectLab = labs
+                    , labSize = 4
+                    , legendPosition="top"
+                    )
+}
+
+fgseaAna <- function(res) {
+  res <- res[order(res$log2FoldChange),]
+  v <- setNames(res$log2FoldChange, res$gene)
+  v <- na.omit(v)
+  v <- v[!is.infinite(v)]
+  v <- v[!is.null(v)]
+  pathways <- fgsea::gmtPathways("./data/m5.go.v2022.1.Mm.symbols.gmt")
+  out <- fgsea(pathways = pathways,
+               stats = v,
+               minSize = 2,
+               maxSize = 200)
+  return(out)
+}
+
+
+dotPlot <- function(df,title=NA) {
+  df <- df[df$padj < 0.05,]
+  df <- df[order(abs(df$ES)),]
+  df$leadingEdge <- NULL
+  df$logFDR <- -log10(df$padj)
+  df$pathway <- gsub("_", " ", df$pathway)
+  df <- na.omit(df)
+  df <- df[1:min(20,nrow(df)),]
+  df <- df[order(df$ES, decreasing = FALSE),]
+  df$pathway <- factor(df$pathway, levels = df$pathway)
+  
+  return(
+    ggplot(df, aes(x = ES, y = pathway, size = size, color = logFDR)) +
+      geom_point() +
+      scale_colour_gradient(low = "blue", high = "red") +
+      xlab('Enrichment score (ES)') +
+      ylab('') +
+      ggtitle(title) +
+      labs(colour=expression('-log'[10]*'FDR'), size = 'Pathway Size') +
+      scale_colour_gradient(low = 'blue', high = 'red') +
+      theme_bw() +
+      theme(legend.position = 'bottom')
+    )
+}
+
+
+# custom plotPCA
+plotPCA <- function(object, intgroup="sep", ntop=500, returnData=FALSE) {
+  rv <- rowVars(assay(object))
+  select <- order(rv, decreasing=TRUE)[seq_len(min(ntop, length(rv)))]
+  pca <- prcomp(t(assay(object)[select,]))
+  percentVar <- pca$sdev^2 / sum( pca$sdev^2 )
+  if (!all(intgroup %in% names(colData(object)))) {
+    stop("the argument 'intgroup' should specify columns of colData(dds)")
+  }
+  intgroup.df <- as.data.frame(colData(object)[, intgroup, drop=FALSE])
+  group <- if (length(intgroup) > 1) {
+    factor(apply( intgroup.df, 1, paste, collapse=":"))
+  } else {
+    colData(object)[[intgroup]]
+  }
+  d <- data.frame(PC1=pca$x[,1], PC2=pca$x[,2], group=group, intgroup.df, name=colnames(object))
+  if (returnData) {
+    attr(d, "percentVar") <- percentVar[1:2]
+    return(d)
+  }
+  colors <- c('#e41a1c','#377eb8','#4daf4a','#984ea3')
+  colors <- adjustcolor(colors, alpha = 0.75)
+  ggplot(data=d, aes_string(x="PC1", y="PC2", fill="group", color="group", pch = "group")) + 
+    geom_point(size=3) + 
+    xlab(paste0("PC1: ",round(percentVar[1] * 100),"% variance")) +
+    ylab(paste0("PC2: ",round(percentVar[2] * 100),"% variance")) +
+    scale_shape_manual(values=c(17, 18, 19, 15))+
+    scale_color_manual(values = colors) +
+    scale_fill_manual(values = colors) +
+    coord_fixed() +
+    theme_bw()
+}
+
+``` 
+
+```{r load data,results="hide",message=F,echo=F,warning=F}
+# load the genecode file
+tx2gene<-read.table("./data/tx2gene.GENCODE.vM19.txt",sep="\t",header=T,stringsAsFactors=F)        
+# load the salmon files
+salmon_dir <- "./data/sf/"
+files <- list.files(salmon_dir,pattern = '*.sf.txt',full.names = TRUE)
+
+txi<-tximport(files,type="salmon",tx2gene=tx2gene, ignoreAfterBar = TRUE)
+
+# remove data with under 2 sampel with 5 count as shown in the paper.
+txi.filter<-apply(txi$counts,1,function(x) length(x[x>5])>=2)
+    
+txi$counts<-txi$counts[txi.filter,]
+txi$abundance<-txi$abundance[txi.filter,]
+txi$length<-txi$length[txi.filter,]
+# convert rown names to get rid of trailing dots
+v <- rownames(txi$counts)
+v <- gsub('\\.[0-9]*$','',v)
+rownames(txi$abundance) <- v
+rownames(txi$counts) <- v
+rownames(txi$length) <- v
+# get the conversion to gene names
+conv <- mapIds(
+  org.Mm.eg.db,
+  keys = v,
+  column = 'SYMBOL',
+  keytype = 'ENSEMBL'
+  )
+```
+
+```{r fix_colnames, echo=FALSE, message=FALSE, warning=FALSE}
+colNames <- files#list.files(salmon_dir,pattern = '*.sf.txt')
+colNames <- gsub(salmon_dir,"",files)
+colNames <- gsub("\\/","",files)
+colNames <- gsub("\\.datasf","", colNames)
+colNames <- gsub("GSM........","", colNames)
+colNames <- gsub("_quant.sf.txt","", colNames)
+colNames <- gsub("9_tub_SHAM_M_lib_B","9B_tub_SHAM_M", colNames)
+colNames <- gsub("endo", "endothelial", colNames)
+colNames <- gsub("tub", "tubular", colNames)
+colNames <- gsub("_F", "_female", colNames)
+colNames <- gsub("_M", "_male", colNames)
+colNames <- gsub("SHAM", "sham", colNames)
+colNames <- gsub("IR", "IRI", colNames)
+
+# change colnames of txi data
+colnames(txi$abundance) <- colNames
+colnames(txi$counts) <- colNames
+colnames(txi$length) <- colNames
+
+conditions <- strsplit(colNames, '_')
+colData <- as.data.frame(do.call("rbind", conditions))
+rownames(colData) <- colNames
+colnames(colData) <- c("ID", "tissue", "condition", "gender")
+colData <- colData[,-1]
+```
+
+# Introduction
+
+
+AKI is a disease associated with adverse outcomes, such as hospitalizaitons, mortality, and development of chronic kidney disease (CKD).
+AKI does not currently have any therapies. 
+Moreover, the differences between male and female sexes is not well characterized.
+Viñas et al.[@vinas_sex_2020] thefore analyzed the male and female mice before and after IRI to chracterize the sex differences
+and potentially find novel pathways that may be invovled in protecting females.
+
+This document contains an analysis of 24 RNA-seq samples under four experimental conditions from the study.
+This data is obtained form GEO series
+[GSE144622](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE144622) 
+[@vinas_sex_2020].
+Raw data is available from NCBI Gene Expression Omnibus (GEO) 
+[accessible here](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE144871).
+Data contains 24 samples with the following properties:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+knitr::kable(colData, caption = "Information of the samples in RNA-Seq data")
+```
+
+# Materials and Methods
+
+The document has mimicked the differential expression analysis of the original paper as closely as possible.
+However, it tries to expand on the analysis and use other methods to further verify the robustness of the results. 
+Notably, we aim to use gene-set enrichment analysis (GSEA) instead of over-representation analysis (ORA) used by the researchers.
+
+In this workbook we would utilize multiple packages:
+
++ `DESeq2` for differential gene expression analysis [@love_moderated_2014].
++ `apeglm` for log fold change shrinkage [@zhu_heavy-tailed_2019].
++ `ComplexHeatmaps` for the heatmaps[@gu_complex_2016].
++ `fgsea` for GSEA[@korotkevich_fast_2021].
+
+For pathway analysis, as the paper focuses most on GO biological pathways,
+we would use the dataset from 
+[MSigDBs GO: Gene Ontology gene sets](https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2022.1.Mm/m5.go.v2022.1.Mm.symbols.gmt)
+We use the gene symbols for GSEA analysis.
+
+
+## Removing technical replicates
+
+As you may see in the previous figure, 
+the samples of the experiment we have 
+`9_tubular_sham_male` and `9B_tubular_sham_male` samples. 
+These have the description `Sham M PTs rep 3` and `Sham M PTs rep 3B` associated with them and are considered **technical replicates**.
+Therefore we should remove one of them form the analysis. 
+For this document we remove the replicate with the lowest read count.
+
+Looking at the read count from each of the smaples we get:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+org <- sum(txi$counts[,"9_tubular_sham_male"]) / 1e6
+rep <- sum(txi$counts[,"9B_tubular_sham_male"]) / 1e6
+t <- data.frame(replicates = c("3", "3B"), read_count = c(org,rep))
+ggplot(t,aes(x = replicates, y = read_count)) +
+  geom_bar(stat = 'identity') +
+  geom_hline(yintercept = 0) +
+  xlab('Replicates') +
+  ylab('Read count (Million)') + geom_text(aes(label = signif(read_count,5)), vjust = -1) +
+  scale_y_continuous(limits = c(0,25), expand = c(0,0)) +
+  theme_classic()
+
+```
+
+As you may observe both replicates have highly similar read counts so removing one would not affect the analysis significantly.
+For this analysis, we removed replicate 3B since it has a slightly lower read count.
+
+```{r rm_tech_rep, echo=FALSE, message=FALSE, warning=FALSE}
+to_rm <- c("9B_tubular_sham_male")
+l <- rm_cols(list(txi = txi, colData = colData), to_rm)
+txi <- l$txi
+colData <- as.data.frame(l$colData)
+```
+
+If we look again at our data we see that we have 23 samples left:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+knitr::kable(colData
+             , caption = "Information of the remaining samples in RNA-Seq data after removal of the technical replicate")
+```
+
+# Results
+
+## Sample distributions
+
+### Proximal tubules
+
+In `Figure 3`, authors provide evidence showing that the greatest separation 
+in gene expression is between male and females, followed by the presence of IRI
+as the second largest factor.
+
+To show this relationship, authors aim to show the variation of gene
+expression between their samples from endothelial and proximal tubule subsets
+using principal component analysis (PCA).
+PCA is calculated using rlog-transformed normalized count values for all transcripts.
+
+If we look at the PCA results from proximal tubules, we can see that the resulting plot
+perfectly matches the plot seen in the paper:
+
+```{r pca.tubule, echo=FALSE, message=FALSE, warning=FALSE}
+# # initial deseq2 analysis
+to_rm <- grep('endothelial', rownames(colData), value = TRUE)
+colData.t <- as.data.frame(colData)
+colData.t[,"gender"] <- ifelse(colData.t[,"gender"] == 'male', 'M', 'F')
+colData.t$sep <- paste(toupper(colData.t[,"condition"]), colData.t[,"gender"], sep = ' ')
+colData.t$sep <- as.factor(colData.t$sep)
+dds <- deseq_ana(rm_cols(list(txi = txi, colData = colData.t), to_rm))
+# # Make rlog (regularlized log) transform of counts
+rld<-rlog(dds)
+plotPCA(rld,intgroup="sep")+
+  ggtitle("Proximal tubules")
+```
+
+Therefore the PCA plot was reproducible and the results supports the hypothesis 
+that the greatest source of variation is gender (most distinction) followed by treatment.
+
+This data also shows that the expression pattern of male and female mice is more similar 
+to each other when they have IRI compared to wild-type.
+
+We can further expand on their analysis by calculating the distance between the rlog-transformed data.
+We can the visualize the distance of gene expression between samples in a heatmap.
+Afterwards, we can perform clustering to visualize what samples cluster together.
+
+> Note that we remove the `tubular` part of the name for simplicity.
+
+```{r cluster.tubule, echo=FALSE, message=FALSE, warning=FALSE}
+# get color pallete
+# calculating eucledian distance from log transformed data
+sampleDists<-dist(t(assay(rld)))
+# Reshape distance vector into a matrix
+sdm<-as.matrix(sampleDists)
+# fix col and rownames
+rown <- rownames(colData(rld))
+rown <- gsub('_male', ' M', rown)
+rown <- gsub('_female', ' F', rown)
+rown <- gsub('_tubular_', ' ', rown)
+colnames(sdm)<- rownames(sdm) <- rown
+
+ComplexHeatmap::Heatmap(sdm
+    , col = c(
+        rev(c('#f7fbff','#deebf7','#c6dbef','#9ecae1','#6baed6','#4292c6','#2171b5','#08519c','#08306b')),
+        c('#fff5f0','#fee0d2','#fcbba1','#fc9272','#fb6a4a','#ef3b2c','#cb181d','#a50f15','#67000d')
+    )
+    , name =  "Euclidean \n distance"
+    , show_column_names=TRUE
+    , column_title = "Proximal tubules"
+)
+
+```
+
+This distance heatmap however, does not fully align with and does not support 
+the results of the experiment.
+The clustering of the samples does not follow a strict distinction between male or female.
+However there are two instances where male patients cluster together:
+
++ cluster 1: `5 sham M`, `6 sham M`, `7 IRI M`
++ cluster 2: `3 IRI M`, `4 IRI M`
+
+> Note: this results may not support the PCA analysis since PCA is performed using the top 500 most differentially expressed genes. 
+
+### Endothelial cells
+
+
+Next, if we look at the PCA results from endothelial, we can see that the resulting plot
+perfectly matches the plot seen in the paper:
+
+```{r pca.endo, echo=FALSE, message=FALSE, warning=FALSE}
+# # initial deseq2 analysis
+to_rm <- grep('tubular', rownames(colData), value = TRUE)
+colData.t <- as.data.frame(colData)
+colData.t[,"gender"] <- ifelse(colData.t[,"gender"] == 'male', 'M', 'F')
+colData.t$sep <- paste(toupper(colData.t[,"condition"]), colData.t[,"gender"], sep = ' ')
+colData.t$sep <- as.factor(colData.t$sep)
+dds <- deseq_ana(rm_cols(list(txi = txi, colData = colData.t), to_rm))
+# # Make rlog (regularlized log) transform of counts
+rld<-rlog(dds)
+plotPCA(rld,intgroup="sep")+
+  ggtitle("Endothelial cells")
+```
+
+Therefore the PCA plot was reproducible and the results supports the hypothesis 
+that the greatest source of variation is gender (most distinction) followed by treatment.
+In the case of this PCA analysis, we can see that the effect of treatment is even lower on endothelial cells as compared to proximal tubule cells.
+
+\linebreak
+
+
+We can further expand on their analysis by calculating the distance and visualizing it in a heatmap with clustering similar to the previous section.
+
+> Note that we remove the `endothelial` part of the name for simplicity.
+
+```{r cluster.endo, echo=FALSE, message=FALSE, warning=FALSE}
+# get color pallete
+# calculating eucledian distance from log transformed data
+sampleDists<-dist(t(assay(rld)))
+# Reshape distance vector into a matrix
+sdm<-as.matrix(sampleDists)
+# fix col and rownames
+rown <- rownames(colData(rld))
+rown <- gsub('_male', ' M', rown)
+rown <- gsub('_female', ' F', rown)
+rown <- gsub('_tubular_', ' ', rown)
+rown <- gsub('_endothelial_', ' ', rown)
+colnames(sdm)<- rownames(sdm) <- rown
+
+ComplexHeatmap::Heatmap(sdm
+    , col = c(
+        rev(c('#f7fbff','#deebf7','#c6dbef','#9ecae1','#6baed6','#4292c6','#2171b5','#08519c','#08306b')),
+        c('#fff5f0','#fee0d2','#fcbba1','#fc9272','#fb6a4a','#ef3b2c','#cb181d','#a50f15','#67000d')
+    )
+    , name =  "Euclidean \n distance"
+    , show_column_names=TRUE
+    , column_title = "Endothelial cells"
+)
+
+```
+
+
+Similar to the previous example, this distance heatmap does not fully align with 
+the results of the experiment.
+The clustering of the samples does not follow a strict distinction between male or female.
+However, it can be argued that male samples and female samples with IRI tend to cluster with each other more often.
+
+> Note: this results may not support the PCA analysis since PCA is performed using the top 500 most differentially expressed genes. 
+
+## Comparison of sham mices
+
+\linebreak
+
+In the paper the researchers performed differential gene expression analysis on sham male versus female mice in both tissues studies.
+
+The research mentions several genes that have been significantly upregulated in:
+
++ male mice: `Acsm3, Ces1f, Cyp4b1, Cyp7b1, Cyb2e1, Slc22a29, Lcn2`
++ female mice: `Slc7a12, Kynu, Prlr, Dio1, Spp1, Rdh16`
+
+### Proximal tubules
+
+The overall structure of the volcano plot reproduced is similiar with the 
+volcano plot on `Figure 4 A`.
+However, there are some small discrepency in the Data. 
+For example, Dio1 has higher $log_{10}P$ than Bhmt in the paper but here it is lower.
+
+```{r vol.con.proxi, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 8.5, fig.width = 8.5}
+# removing endothelial cells
+to_rm <- grep('endothelial', rownames(colData), value = TRUE)
+l <- rm_cols(list(txi = txi, colData = colData), to_rm)
+# removing IRI cells
+to_rm <- grep('IRI', rownames(l$colData), value = TRUE)
+l <- rm_cols(l, to_rm)
+colData.t <- l$colData
+colData.t[,"gender"] <- ifelse(colData.t[,"gender"] == 'male', 'M', 'F')
+colData.t$sep <- colData.t[,"gender"]
+colData.t$sep <- factor(colData.t$sep, levels = c("F", "M"))
+dds <- deseq_ana(list(txi = l$txi, colData = colData.t))
+res <- shrinklfc(dds)
+labs <- c("Acsm3", "Ces1f", "Cyp4b1", "Cyp7b1", "Cyb2e1", "Slc22a29", "Lcn2", "Slc7a12", "Kynu", "Prlr", "Dio1", "Spp1", "Rdh16", "Bhmt", "Slc22a30")
+plotVolcano(res, labs = labs, title = 'Sham M vs F proximal tubule')
+```
+
+Moreover, we can reproduce the table of top 20 up-regulated gene and top 20 down-regulated genes.
+Genes are not in the same order but most of the genes are present in the tables made by the paper and the reproduced tables. 
+
+
+```{r tbl.up.con.proxi, echo=FALSE, message=FALSE, warning=FALSE}
+res.t <- as.data.frame(res[!is.na(res$gene),])
+res.t <- res.t[order(res.t$log2FoldChange, decreasing = TRUE),]
+rownames(res.t) <- make.unique(res.t$gene)
+res.t <- res.t[rownames(res.t) %in% res.t$gene,]
+res.t <- res.t[order(res.t$log2FoldChange, decreasing = TRUE),]
+res.t$gene <- NULL
+knitr::kable(head(res.t, n = 20), caption = "Top 20 up-regualted genes for Sham M vs F in proximal tubules")
+```
+
+```{r tbl.down.con.proxi, echo=FALSE, message=FALSE, warning=FALSE}
+res.t <- as.data.frame(res[!is.na(res$gene),])
+res.t <- res.t[order(res.t$log2FoldChange),]
+rownames(res.t) <- make.unique(res.t$gene)
+res.t <- res.t[rownames(res.t) %in% res.t$gene,]
+res.t <- res.t[order(res.t$log2FoldChange),]
+res.t$gene <- NULL
+knitr::kable(head(res.t, n = 20), caption = "Top 20 down-regualted genes for Sham M vs F in proximal tubules")
+```
+
+To further the study's results, GSEA of the results could be performed using 
+$log_2(FoldChange)$ to rank the genes.
+In this analysis, we can see that the ribosomal and metabolic pathways are downregualted in male proximal tubule cells compared to female data.
+
+```{r gsea.con.proxi, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 8.5, fig.width = 8.5}
+df <- fgseaAna(res)
+dotPlot(df, title = "Diff exp path in Sham M vs F in PT")
+```
+
+In `Figure 9`, researchers studies the expression of 7 genes using 
+*real-time PCR* in sham mice kidney and PT. 
+They found that `Cyp7b1, Slc7a12, Cyp2b10` are over expressed in female mice.
+On the other hand `Havcr1, Lcn2, Krt20, Csnk1e` are over expressed in male mice.
+We can also check the differential gene expression of these genes in
+the RNA-Seq data.
+
+
+\linebreak
+
+Using RNA-Seq data we can confirm that the expression of some genes are consistent:
+
+- Higher in M: `Csnk1e, Cyp2b10, Cyp7b1, Lcn2`
+- Higher in F: `Slc7a12`
+
+But the gene expression of `Havcr1` and `Krt20` are not significant.
+This is most likely due to the limitations of RNA-Seq for high percision quantification of a low number of genes.
+
+
+```{r bar.iri.pcr.proxi, echo=FALSE, message=FALSE, warning=FALSE}
+# choose out genes
+genes <- c('Cyp7b1', 'Slc7a12', 'Cyp2b10','Havcr1','Lcn2','Krt20','Csnk1e')
+res.t <- as.data.frame(res[!is.na(res$gene),])
+res.t <- res.t[order(res.t$log2FoldChange),]
+rownames(res.t) <- make.unique(res.t$gene)
+res.t <- res.t[rownames(res.t) %in% res.t$gene,]
+res.t <- res.t[order(res.t$log2FoldChange),]
+res.t <- res.t[rownames(res.t) %in% genes,]
+
+ggplot(res.t, aes(x = gene, y = log2FoldChange)) +
+  geom_bar(stat = 'identity', width = 0.75) +
+  geom_hline(yintercept = 0) +
+  geom_text(aes(label = paste('FDR:',signif(padj,3))), vjust = 0.5) +
+  theme_classic() +
+  ggtitle("Select DEGs in sham M vs F in proximal tubule") +
+  ylim(-2, 10) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+Looking at the CPM values, we can see that the differnce between the samples is not very clear.
+
+```{r heat.iri.pcr.proxi, echo=FALSE, message=FALSE, warning=FALSE}
+count <- l$txi$counts
+colnames(count) <- gsub("tubular", "", colnames(count))
+colnames(count) <- gsub("female", "F", colnames(count))
+colnames(count) <- gsub("male", "M", colnames(count))
+colnames(count) <- gsub("_", " ", colnames(count))
+rownames(count) <- make.unique(conv[rownames(count)])
+count <- edgeR::cpm(count)
+count <- count[rownames(count) %in% genes,]
+count <- log10(count + 1)
+  
+ComplexHeatmap::Heatmap(count
+    , col = c(
+        c('#fff5f0','#fee0d2','#fcbba1','#fc9272','#fb6a4a','#ef3b2c','#cb181d','#a50f15','#67000d')
+    )
+    , name =  "log10(CPM + 1)" 
+    , cluster_columns = FALSE
+    , show_column_names=TRUE
+    , column_title = "Select DEGs in sham M vs F in proximal tubule"
+)
+```
+
+
+
+
+### Endothelial cells
+
+Like the tubular tissue, overall structure of the volcano plot reproduced is 
+similar with the volcano plot on `Figure 4 B`.
+More importantly, like last time, most of the genes are in the correct direction.
+
+
+```{r vol.con.endo, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 8.5, fig.width = 8.5}
+# removing tubular cells
+to_rm <- grep('tubular', rownames(colData), value = TRUE)
+l <- rm_cols(list(txi = txi, colData = colData), to_rm)
+# removing IRI cells
+to_rm <- grep('IRI', rownames(l$colData), value = TRUE)
+l <- rm_cols(l, to_rm)
+colData.t <- l$colData
+colData.t[,"gender"] <- ifelse(colData.t[,"gender"] == 'male', 'M', 'F')
+colData.t$sep <- colData.t[,"gender"]
+colData.t$sep <- factor(colData.t$sep, levels = c("F", "M"))
+dds <- deseq_ana(list(txi = l$txi, colData = colData.t))
+res <- shrinklfc(dds)
+labs <- c("Acsm3", "Ces1f", "Cyp4b1", "Cyp7b1", "Cyb2e1", "Slc22a29", "Lcn2"
+          , "Slc7a12", "Kynu", "Prlr", "Dio1", "Spp1", "Rdh16","Bhmt", "Slc22a30"
+          ,"Ugt1a2", "Slco1a1", "Kap")
+plotVolcano(res, labs = labs, title = 'Sham M vs F endothelial cells')
+```
+
+Like the data in proximal tubule, we can reproduce the table of top 20 up-regulated gene and top 20 down-regulated genes.
+Genes are not in the same order but most of the genes are present in the tables made by the paper and the reproduced tables. 
+Xist is a notable exception to the trend as it appears at the top with $log_2(FoldChange)$ of -16.23. 
+However, this can be due to differences in the package version, software versions, and operating systems used.
+
+```{r tbl.up.con.endo, echo=FALSE, message=FALSE, warning=FALSE}
+res.t <- as.data.frame(res[!is.na(res$gene),])
+res.t <- res.t[order(res.t$log2FoldChange, decreasing = TRUE),]
+rownames(res.t) <- make.unique(res.t$gene)
+res.t <- res.t[rownames(res.t) %in% res.t$gene,]
+res.t <- res.t[order(res.t$log2FoldChange, decreasing = TRUE),]
+res.t$gene <- NULL
+knitr::kable(head(res.t, n = 20), caption = "Top 20 up-regualted genes for Sham M vs F in endothelial tissue")
+```
+
+```{r tbl.down.con.endo, echo=FALSE, message=FALSE, warning=FALSE}
+res.t <- as.data.frame(res[!is.na(res$gene),])
+res.t <- res.t[order(res.t$log2FoldChange),]
+rownames(res.t) <- make.unique(res.t$gene)
+res.t <- res.t[rownames(res.t) %in% res.t$gene,]
+res.t <- res.t[order(res.t$log2FoldChange),]
+res.t$gene <- NULL
+knitr::kable(head(res.t, n = 20), caption = "Top 20 down-regualted genes for Sham M vs F in endothelial tissue")
+```
+
+
+To further the study's results, GSEA of the results could be performed using 
+$log_2(FoldChange)$ to rank the genes.
+In endothelial cells, we can observe that there are no significantly differentially experssed genes using FDR < 0.05 as threshold.
+If we use P value, we can see that we have positive enrichment of immunity and metbaolic pathways pathways,
+and negative enrichment of of differentiation pathways in male versus female endothelial cells.
+
+
+\linebreak
+
+**This supports the hypothesis that there are significant sexual dysmorphism in kidney tissue in mice and the effect is more distinctly observed in proximal tubules than endothelial cells.**
+
+```{r gsea.con.endo, echo=FALSE, message=FALSE, warning=FALSE}
+df <- fgseaAna(res)
+df <- df[order(abs(df$padj), decreasing = FALSE),]
+df$leadingEdge <- NULL
+df$pathway <- gsub("_", " ", df$pathway)
+knitr::kable(head(df, n = 15), caption = "Diff exp path in Sham M vs F in endothelial tissue")
+```
+
+
+## Comparison of IRI mices
+
+\linebreak
+
+In the paper the researchers performed differential gene expression analysis on sham male versus female mice in both tissues studies.
+
+The research mentions several genes that have been significantly upregulated in:
+
+
+### Proximal tubules
+
+The overall structure of the volcano plot reproduced is similiar with the 
+volcano plot on `Figure 6 A`.
+Majority of the genes highlighted in the volcano plot by the researchers
+are also significantly differentially expressed in the reproduced volcano plot and are in the same direction.
+
+```{r vol.iri.proxi, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 8.5, fig.width = 8.5}
+# removing endothelial cells
+to_rm <- grep('endothelial', rownames(colData), value = TRUE)
+l <- rm_cols(list(txi = txi, colData = colData), to_rm)
+# removing sham cells
+to_rm <- grep('sham', rownames(l$colData), value = TRUE)
+l <- rm_cols(l, to_rm)
+colData.t <- l$colData
+colData.t[,"gender"] <- ifelse(colData.t[,"gender"] == 'male', 'M', 'F')
+colData.t$sep <- colData.t[,"gender"]
+colData.t$sep <- factor(colData.t$sep, levels = c("F", "M"))
+dds <- deseq_ana(list(txi = l$txi, colData = colData.t))
+res <- shrinklfc(dds)
+labs <- c('Lrp2','Prlr','Ugt1a2','Krt20', 'Clic6', 'Lcn2', 'Slc7a13')
+plotVolcano(res, labs = labs, title = 'IRI M vs F proximal tubule')
+```
+
+Moreover, we can reproduce the table of top 20 up-regulated gene and top 20 down-regulated genes.
+Genes are not in the same order but most of the genes are present in the tables made by the paper and the reproduced tables. 
+
+
+```{r tbl.up.iri.proxi, echo=FALSE, message=FALSE, warning=FALSE}
+res.t <- as.data.frame(res[!is.na(res$gene),])
+res.t <- res.t[order(res.t$log2FoldChange, decreasing = TRUE),]
+rownames(res.t) <- make.unique(res.t$gene)
+res.t <- res.t[rownames(res.t) %in% res.t$gene,]
+res.t <- res.t[order(res.t$log2FoldChange, decreasing = TRUE),]
+res.t$gene <- NULL
+knitr::kable(head(res.t, n = 20), caption = "Top 20 up-regualted genes for IRI M vs F in proximal tubules")
+```
+
+```{r tbl.down.iri.proxi, echo=FALSE, message=FALSE, warning=FALSE}
+res.t <- as.data.frame(res[!is.na(res$gene),])
+res.t <- res.t[order(res.t$log2FoldChange),]
+rownames(res.t) <- make.unique(res.t$gene)
+res.t <- res.t[rownames(res.t) %in% res.t$gene,]
+res.t <- res.t[order(res.t$log2FoldChange),]
+res.t$gene <- NULL
+knitr::kable(head(res.t, n = 20), caption = "Top 20 down-regualted genes for IRI M vs F in proximal tubules")
+```
+
+To further the study's results, GSEA of the results could be performed using 
+$log_2(FoldChange)$ to rank the genes.
+There are key observations that support researcher's hypotehsis:
+
++ Ion transport, voltage gated channels, and Cation transport pathways are down regulated in male IRI (support cationic transporter over expression in females)
++ Oxidative phosphorylation is down regulated in male IRI
++ Up regulation of starvation, stress, and kinase activity (supports up regulation of immunity pathways in male vs female IRI)
+
+```{r gsea.iri.proxi, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 8.5, fig.width = 8.5}
+df <- fgseaAna(res)
+dotPlot(df, title = "Diff exp path in IRI M vs F in PT")
+```
+
+The study has claimed that some key genes are upregualted in male IRI versus female IRI. 
+We can verify that our analysis shows these genes are significantly differentially expressed except for `Egfr`. 
+For `Egfr` however, the FDR value can be considered significant as it is
+slightly over `0.05` limit.
+
+> NOTE: we could not find information from the `Havcr` gene. It is possible that the gene symbol has changed or the ensembel ID was not present.
+
+```{r bar.iri.proxi1, echo=FALSE, message=FALSE, warning=FALSE}
+# choose out genes
+genes <- c('Havcr', 'Lcn2', 'Krt18', 'Krt20', 'Sox9', 'Egfr')
+res.t <- as.data.frame(res[!is.na(res$gene),])
+res.t <- res.t[order(res.t$log2FoldChange),]
+rownames(res.t) <- make.unique(res.t$gene)
+res.t <- res.t[rownames(res.t) %in% res.t$gene,]
+res.t <- res.t[order(res.t$log2FoldChange),]
+res.t <- res.t[rownames(res.t) %in% genes,]
+
+ggplot(res.t, aes(x = gene, y = log2FoldChange)) +
+  geom_bar(stat = 'identity') +
+  geom_hline(yintercept = 0) +
+  geom_text(aes(label = paste('FDR:',signif(padj,3))), vjust = -1) +
+  theme_classic() +
+  ggtitle("Select DEGs in IRI M vs F in proximal tubule") +
+  ylim(min(0,res.t$log2FoldChange), max(res.t$log2FoldChange) + 1) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+Even using the raw count data we can confirm that these genes are over 
+expressed in the male mice versus female mice. 
+However the clustering of the heatmap is successful at
+distinguishing male and female IRI samples.
+
+
+```{r heat.iri.proxi1, echo=FALSE, message=FALSE, warning=FALSE}
+count <- l$txi$counts
+colnames(count) <- gsub("tubular", "", colnames(count))
+colnames(count) <- gsub("female", "F", colnames(count))
+colnames(count) <- gsub("male", "M", colnames(count))
+colnames(count) <- gsub("_", " ", colnames(count))
+rownames(count) <- make.unique(conv[rownames(count)])
+count <- edgeR::cpm(count)
+count <- count[rownames(count) %in% genes,]
+count <- log10(count + 1)
+  
+ComplexHeatmap::Heatmap(count
+    , col = c(c('#fff5f0','#fee0d2','#fcbba1','#fc9272','#fb6a4a','#ef3b2c','#cb181d','#a50f15','#67000d')
+    )
+    , name =  "log10(CPM+1)"
+    , show_column_names=TRUE
+    , column_title = "Select DEGs in IRI M vs F in proximal tubule"
+)
+```
+The study has claimed that some key genes are downregualted in male IRI versus 
+female IRI which were only partially reproduced.
+`Lrp2` gene is significantly underexpressed in M vs F IRI mice, 
+however, `Bcl2` is not.
+
+
+```{r bar.iri.proxi2, echo=FALSE, message=FALSE, warning=FALSE}
+# choose out genes
+genes <- c('Bcl2', 'Lrp2')
+res.t <- as.data.frame(res[!is.na(res$gene),])
+res.t <- res.t[order(res.t$log2FoldChange),]
+rownames(res.t) <- make.unique(res.t$gene)
+res.t <- res.t[rownames(res.t) %in% res.t$gene,]
+res.t <- res.t[order(res.t$log2FoldChange),]
+res.t <- res.t[rownames(res.t) %in% genes,]
+
+ggplot(res.t, aes(x = gene, y = log2FoldChange)) +
+  geom_bar(stat = 'identity') +
+  geom_hline(yintercept = 0) +
+  geom_text(aes(label = paste('FDR:',signif(padj,3))), vjust = 1) +
+  theme_classic() +
+  ggtitle("Select DEGs in IRI M vs F in proximal tubule") +
+  ylim(min(0,res.t$log2FoldChange - 1), 0) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+Even using the raw count data we can confirm that `Lrp2` is over expressed in
+the M vs F IRI mice.
+The expression of `Bcl2` is much less distinct between the samples.
+
+In this heatmap, the clustering cannot fully distinguishe between M vs F.
+
+```{r heat.iri.proxi2, echo=FALSE, message=FALSE, warning=FALSE}
+count <- l$txi$counts
+colnames(count) <- gsub("tubular", "", colnames(count))
+colnames(count) <- gsub("female", "F", colnames(count))
+colnames(count) <- gsub("male", "M", colnames(count))
+colnames(count) <- gsub("_", " ", colnames(count))
+rownames(count) <- make.unique(conv[rownames(count)])
+count <- edgeR::cpm(count)
+count <- count[rownames(count) %in% genes,]
+count <- log10(count + 1)
+  
+ComplexHeatmap::Heatmap(count
+    , col = c(c('#fff5f0','#fee0d2','#fcbba1','#fc9272','#fb6a4a','#ef3b2c','#cb181d','#a50f15','#67000d')
+    )
+    , name =  "log10(CPM+1)"
+    , show_column_names=TRUE
+    , column_title = "Select DEGs in IRI M vs F in proximal tubule"
+)
+```
+
+
+### Endothelial cells
+
+Like the tubular tissue, overall structure of the volcano plot reproduced is 
+similar with the volcano plot on `Figure 4 B`.
+Like proximal tubule samples, majority of the genes highlighted in the volcano plot by the researchers
+are also significantly differentially expressed in the reproduced volcano plot and are in the same direction.
+
+
+```{r vol.iri.endo, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 8.5, fig.width = 8.5}
+# removing tubular cells
+to_rm <- grep('tubular', rownames(colData), value = TRUE)
+l <- rm_cols(list(txi = txi, colData = colData), to_rm)
+# removing sham cells
+to_rm <- grep('sham', rownames(l$colData), value = TRUE)
+l <- rm_cols(l, to_rm)
+colData.t <- l$colData
+colData.t[,"gender"] <- ifelse(colData.t[,"gender"] == 'male', 'M', 'F')
+colData.t$sep <- colData.t[,"gender"]
+colData.t$sep <- factor(colData.t$sep, levels = c("F", "M"))
+dds <- deseq_ana(list(txi = l$txi, colData = colData.t))
+res <- shrinklfc(dds)
+labs <- c("Utg1a2", "Atp13a4", "Hsd17b6", "Slco1a1", "Flf2s3y", "Icam1", "Inhbb", "Acsm3")
+plotVolcano(res, labs = labs, title = 'IRI M vs F endothelial cells')
+```
+
+Like the data in proximal tubule, we can reproduce the table of top 20 up-regulated gene and top 20 down-regulated genes.
+Genes are not in the same order but most of the genes are present in the tables made by the paper and the reproduced tables. 
+
+```{r tbl.up.iri.endo, echo=FALSE, message=FALSE, warning=FALSE}
+res.t <- as.data.frame(res[!is.na(res$gene),])
+res.t <- res.t[order(res.t$log2FoldChange, decreasing = TRUE),]
+rownames(res.t) <- make.unique(res.t$gene)
+res.t <- res.t[rownames(res.t) %in% res.t$gene,]
+res.t <- res.t[order(res.t$log2FoldChange, decreasing = TRUE),]
+res.t$gene <- NULL
+knitr::kable(head(res.t, n = 20), caption = "Top 20 up-regualted genes for IRI M vs F in endothelial tissue")
+```
+
+```{r tbl.down.iri.endo, echo=FALSE, message=FALSE, warning=FALSE}
+res.t <- as.data.frame(res[!is.na(res$gene),])
+res.t <- res.t[order(res.t$log2FoldChange),]
+rownames(res.t) <- make.unique(res.t$gene)
+res.t <- res.t[rownames(res.t) %in% res.t$gene,]
+res.t <- res.t[order(res.t$log2FoldChange),]
+res.t$gene <- NULL
+knitr::kable(head(res.t, n = 20), caption = "Top 20 down-regualted genes for IRI M vs F in endothelial tissue")
+```
+
+
+To further the study's results, GSEA of the results could be performed using 
+$log_2(FoldChange)$ to rank the genes.
+
+This results also supports the results of the paper with key takeaways:
+
++ Up regulation of immunity, stress, and cell cycle pathways (supports the hypothesis that male IRI is more affected than female IRI)
++ Down regulation of lipid catabolic processes (*directly supports the hypothesis that fatty acid metabolism is higher in male IRI*)
+
+
+```{r gsea.iri.endo, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 8.5, fig.width = 8.5}
+df <- fgseaAna(res)
+dotPlot(df, title = "Diff exp path in IRI M vs F in endothelium")
+```
+
+## TNF signaling
+
+Finally researchers looked at the Z-score expression of genes relating to TNF pathway in `Figure 11 A` and `Figure 13 A`.
+pathway in mice to understand the genomic differences between group.
+They showed that male mice post-IRI have highest expression of TNF signaling pathways.
+Therefore, higher immune response might be involved in male susceptibility to AKI.
+
+### Proximal tubules
+
+For proximal tubule samples, we were not able to reproduce their heatmap.
+The male IRI samples could not be clustered together.
+
+```{r TNF.proxi, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 8.5, fig.width = 8.5}
+genes <- c("Ccl20", "Cx3cl1", "Ccl2", "Bcl3", "Mk1", "Vcam1", 
+           "Mmp9", "Ptgs2", "Map2k3", "Cxlc3", "Tnfalp3",
+           "Refa", "Cxcl2", "Tnfrsf1a", "Cxcl10", "Ccl5",
+           "Icam1", "Il1b", "Tnfrsf1b")
+count <- txi$counts
+count <- count[,grep('tubular', colnames(count))]
+colnames(count) <- gsub("tubular", "", colnames(count))
+colnames(count) <- gsub("endothelial", "", colnames(count))
+colnames(count) <- gsub("female", "F", colnames(count))
+colnames(count) <- gsub("male", "M", colnames(count))
+colnames(count) <- gsub("_", " ", colnames(count))
+rownames(count) <- make.unique(conv[rownames(count)])
+# count <- edgeR::cpm(count)
+# count <- log10(count + 1)
+# count <- count[rownames(count) %in% genes,]
+# z <- (count - mean(count, na.rm = TRUE)) / sd(count, na.rm = TRUE)
+count <- count[rownames(count) %in% genes,]
+z <- apply(count,2,function(v) return((v-mean(v,na.rm = TRUE))/sd(v, na.rm = TRUE)))
+  
+ComplexHeatmap::Heatmap(z
+    , col = c(
+        rev(c('#f7fbff','#deebf7','#c6dbef','#9ecae1','#6baed6','#4292c6','#2171b5','#08519c','#08306b')),
+        c('#fff5f0','#fee0d2','#fcbba1','#fc9272','#fb6a4a','#ef3b2c','#cb181d','#a50f15','#67000d')
+    )
+    , name =  "Z score \n log10CPM"
+    , show_column_names=TRUE
+    , column_title = "TNF signaling pathway of proximal tubule samples"
+)
+```
+
+
+### Endothelial cells
+
+For endothelial cells, we were not able to fully reproduce their heatmap. 
+IRI male patients do appear to have higher expression of TNF signaling genes and they cluster together but the results 
+is not as visually striking as seen in the paper.
+
+```{r TNF.endo, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 8.5, fig.width = 8.5}
+genes <- c("Ccl20", "Cx3cl1", "Ccl2", "Bcl3", "Mk1", "Vcam1", 
+           "Mmp9", "Ptgs2", "Map2k3", "Cxlc3", "Tnfalp3",
+           "Refa", "Cxcl2", "Tnfrsf1a", "Cxcl10", "Ccl5",
+           "Icam1", "Il1b", "Tnfrsf1b")
+count <- txi$counts
+count <- count[,grep('endothelial', colnames(count))]
+colnames(count) <- gsub("tubular", "", colnames(count))
+colnames(count) <- gsub("endothelial", "", colnames(count))
+colnames(count) <- gsub("female", "F", colnames(count))
+colnames(count) <- gsub("male", "M", colnames(count))
+colnames(count) <- gsub("_", " ", colnames(count))
+rownames(count) <- make.unique(conv[rownames(count)])
+#count <- edgeR::cpm(count)
+#count <- log10(count + 1)
+#z <- (count - mean(count, na.rm = TRUE)) / sd(count, na.rm = TRUE)
+count <- count[rownames(count) %in% genes,]
+z <- apply(count,2,function(v) return((v-mean(v,na.rm = TRUE))/sd(v, na.rm = TRUE)))
+  
+ComplexHeatmap::Heatmap(z
+    , col = c(
+        rev(c('#f7fbff','#deebf7','#c6dbef','#9ecae1','#6baed6','#4292c6','#2171b5','#08519c','#08306b')),
+        c('#fff5f0','#fee0d2','#fcbba1','#fc9272','#fb6a4a','#ef3b2c','#cb181d','#a50f15','#67000d')
+    )
+    , name =  "Z score \n log10CPM"
+    , show_column_names=TRUE
+    , column_title = "TNF signaling pathway of endothelial samples"
+)
+```
+
+## Cytokine signaling
+
+Finally researchers looked at the Z-score expression of genes relating to Cytokine pathway in `Figure 11 B` and `Figure 13 B`
+pathway in mice to understand the genomic differneces between group.
+They showed that male mice post-IRI have higher expression of Cytokine pathways relative to other groups.
+Therefore, higher immune response might be involved in male suspetibiltiy to AKI.
+
+### Proximal tubules
+
+For endothelial cells, we were not able to reproduce their heatmap.
+The male IRI samples could not be clustered together.
+
+```{r cyto.proxi, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 8.5, fig.width = 8.5}
+genes <- c("Lepr", "Ccl2", "Tgfbr1", "Tnfrsf12a", "Ifnlr1", 
+           "Tnfsf9", "Ccl5", "Clcf1", "Cxd11", "Inhbb",
+           "Il1r2", "Cxcl2", "Il4ra", "Il20rb", "Ccr4",
+           "Tnfrsf1b", "Il1b", "Osm", "intrsf1a", "Ccr1",
+           "Cxcl10", "Infsf13", "Ccf20", "Cx3cl1")
+count <- txi$counts
+count <- count[,grep('tubular', colnames(count))]
+colnames(count) <- gsub("tubular", "", colnames(count))
+colnames(count) <- gsub("endothelial", "", colnames(count))
+colnames(count) <- gsub("female", "F", colnames(count))
+colnames(count) <- gsub("male", "M", colnames(count))
+colnames(count) <- gsub("_", " ", colnames(count))
+rownames(count) <- make.unique(conv[rownames(count)])
+#count <- edgeR::cpm(count)
+#count <- log10(count + 1)
+#z <- (count - mean(count, na.rm = TRUE)) / sd(count, na.rm = TRUE)
+#z <- z[rownames(z) %in% genes,]
+count <- count[rownames(count) %in% genes,]
+z <- apply(count,2,function(v) return((v-mean(v,na.rm = TRUE))/sd(v, na.rm = TRUE)))
+  
+ComplexHeatmap::Heatmap(z
+    , col = c(
+        rev(c('#f7fbff','#deebf7','#c6dbef','#9ecae1','#6baed6','#4292c6','#2171b5','#08519c','#08306b')),
+        c('#fff5f0','#fee0d2','#fcbba1','#fc9272','#fb6a4a','#ef3b2c','#cb181d','#a50f15','#67000d')
+    )
+    , name =  "Z score \n log10CPM"
+    , show_column_names=TRUE
+    , column_title = "Cytokine signaling pathway of proximal tubule samples"
+)
+```
+
+
+### Endothelial cells
+
+For endothelial cells, we were not able to reproduce their heatmap.
+The male IRI samples could not be clustered together.
+
+```{r cyto, echo=FALSE, message=FALSE, warning=FALSE, fig.height = 8.5, fig.width = 8.5}
+genes <- c("Lepr", "Ccl2", "Tgfbr1", "Tnfrsf12a", "Ifnlr1", 
+           "Tnfsf9", "Ccl5", "Clcf1", "Cxd11", "Inhbb",
+           "Il1r2", "Cxcl2", "Il4ra", "Il20rb", "Ccr4",
+           "Tnfrsf1b", "Il1b", "Osm", "intrsf1a", "Ccr1",
+           "Cxcl10", "Infsf13", "Ccf20", "Cx3cl1")
+count <- txi$counts
+count <- count[,grep('endothelial', colnames(count))]
+colnames(count) <- gsub("tubular", "", colnames(count))
+colnames(count) <- gsub("endothelial", "", colnames(count))
+colnames(count) <- gsub("female", "F", colnames(count))
+colnames(count) <- gsub("male", "M", colnames(count))
+colnames(count) <- gsub("_", " ", colnames(count))
+rownames(count) <- make.unique(conv[rownames(count)])
+#count <- edgeR::cpm(count)
+#count <- log10(count + 1)
+#z <- (count - mean(count, na.rm = TRUE)) / sd(count, na.rm = TRUE)
+#z <- z[rownames(z) %in% genes,]
+count <- count[rownames(count) %in% genes,]
+z <- apply(count,2,function(v) return((v-mean(v,na.rm = TRUE))/sd(v, na.rm = TRUE)))
+  
+ComplexHeatmap::Heatmap(z
+    , col = c(
+        rev(c('#f7fbff','#deebf7','#c6dbef','#9ecae1','#6baed6','#4292c6','#2171b5','#08519c','#08306b')),
+        c('#fff5f0','#fee0d2','#fcbba1','#fc9272','#fb6a4a','#ef3b2c','#cb181d','#a50f15','#67000d')
+    )
+    , name =  "Z score \n log10CPM"
+    , show_column_names=TRUE
+    , column_title = "Cytokine signaling pathway of endothelial samples"
+)
+```
+
+# Discussion and Conclusion
+
+The results of the paper where reproducible majority of the times. 
+Further gene-set enrichment analysis (GSEA) has further validated the paper's claim that
+there are significant sexual dimorphism in the normal kidney and IRI patients.
+As seen in the volcano plots.
+Furthermore, we can support the paper's claim that the differential expression in proximal tubules is more distinct that in endothelial cells.
+
+The significantly differentially expressed genes and pathways in this study are 
+worthy of further investigation to improve our understanding of the sex differences
+in IRI and to develop AKI therapeutics.
+
+## Pathway analysis
+
+Lastly, the positive enrichment of immunity pathways in M vs F IRI (dotplot)
+further supports the hypothesis that IRI condition is more severe in males than females.
+
+The overregulation of ionic transport pathways, particularly cationic transport pathways in female IRI mice in proximal tubules, can also be a potential  protective factor in females in acute kidney injury.
+
+## TNF and Cytokine heatmaps
+
+For key genes of TNF and Cytokine pathways, 
+we were **not able to** reproduce the over expression of IRI male samples. 
+However, we suspect reproducibility of the Cytokine and TNF heatmaps is possible with access to source code of the analysis.
+
+## Code reproducibility
+
+R script used to generate the results was claimed to be uploaded in a [github reporistory](https://github.com/retropc66/Mouse_kidney_IRI_RNA-seq).
+However, as of today, the last commit is a readme file mentioning that the code would be published soon.
+
+Fortunately, the researchers provided sufficient information in the methodology section to reproduce the majority of the results accurately. 
+
+# References
+
+<div id="refs"></div>
+
+# File generation date and environment
+
+File generation timestamp: `r date()`
+
+Packages used for generating the code:
+
+```{r sessionInfo}
+sessionInfo()
+```
+
