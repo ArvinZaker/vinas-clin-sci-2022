@@ -1,8 +1,11 @@
 # Reproducting analysis in the paper: Sex diversity in proximal tubule and endothelial gene expression in mice with ischemic acute kidney injury
 
+This repository contains the report that reproduces some of the results from the study by Viñas et al. (2020).
+A precomplied report is available as a `.html` file in the project's root directory (`report.html`).
+
+## steps to reproduce the analysis
 
 This analysis requires downloading the raw salmon files (`.sf`) from the study. 
-A precomplied report is available as a `.html` file in the project's root directory (`report.html`).
 
 To download the data for this analysis, follow these steps:
 
@@ -11,10 +14,16 @@ To download the data for this analysis, follow these steps:
 - The files download are in `.gz` format. Place them in the `./data/sf` folder
 - Execute the following command to uncompress all files:
 
+
 ```
 gunzip *.gz
 ```
 
-- All
+- You can now recompile the report by using Rstudio `knitr` function or by executing the following command:
+
+
+```
+Rscript -e "rmarkdown::render('report.rmd', 'html_document')"
+```
 
 
